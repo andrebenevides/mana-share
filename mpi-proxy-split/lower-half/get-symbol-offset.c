@@ -22,6 +22,7 @@ off_t get_symbol_offset(const char *pathname, const char *symbol) {
   int foundDebugLib = 0;
   char debugLibName[PATH_MAX] = {0};
   char *shsectData = NULL;
+  char *debugName = NULL;
 
   // FIXME:  Rohan's version wraps the rest of this function
   //         in 'while (retries < 2) { ... }' and then uses two
@@ -76,7 +77,6 @@ off_t get_symbol_offset(const char *pathname, const char *symbol) {
       // If it's the ".gnu_debuglink" section, we read it to figure out
       // the path to the debug symbol file
       Elf64_Shdr tmp;
-      char *debugName = NULL;
       // FIXME:  Either expand this inline (if short), or more likely
       //         use readElfSection() also in case of ".strtab", above
       //         (like Rohan's version).
@@ -94,29 +94,29 @@ off_t get_symbol_offset(const char *pathname, const char *symbol) {
       //       /lib/ld-linux.so.2 -> /lib64/ld-2.28.so
       //       /usr/lib/debug/lib64/libc-2.28.so-2.28-236.el8_9.7.x86-64.debug 
       //       Package glibc-debuginfo-*.rpm exists: provides libc-*.debug
-      if (access("/lib/debug/.build-id", F_OK) == 0) { // If Debian/Ubuntu
-        // Debian variants use separate debug symbol file: /lib/debug/.build-id
-        // The file below is the older hierarchy.  Now it uses .build-id.
-        snprintf(debugLibName, sizeof debugLibName, "%s/%s",
-                 "/usr/lib/debug/lib/x86_64-linux-gnu", debugName);
-        if (! expandDebugFile(debugLibName,
-                              "/lib/debug/.build-id", debugName)) {
-          fprintf(stderr,
-            "\nsymtab was stripped from ld-linux.so file, and no debug file\n"
-            "was found in .build-id.  Consider installing libc6-dbg package,\n"
-            "or else build a new libc6 from source.  In the latter case,\n"
-            "set LD_LIBRARY_PATH to your locally built ld-linux.so\n\n");
-          abort();
-        }
-        close(fd);
-        fd = open(debugLibName, O_RDONLY);
-        assert(fd != -1);
-        return get_symbol_offset(debugLibName, symbol);
-      }
-      free(debugName);
       foundDebugLib = 1;
     }
   }
+  free(shsectData);
+  if (!symtab_found && foundDebugLib) {
+    if (access("/lib/debug/.build-id", F_OK) == 0) { // If Debian/Ubuntu
+      // Debian variants use separate debug symbol file: /lib/debug/.build-id
+      // The file below is the older hierarchy.  Now it uses .build-id.
+      snprintf(debugLibName, sizeof debugLibName, "%s/%s",
+               "/usr/lib/debug/lib/x86_64-linux-gnu", debugName);
+      if (! expandDebugFile(debugLibName,
+                            "/lib/debug/.build-id", debugName)) {
+        // Let the caller try the ELF build ID or another debug root.
+        free(debugName);
+        close(fd);
+        return 0;
+      }
+      free(debugName);
+      close(fd);
+      return get_symbol_offset(debugLibName, symbol);
+    }
+  }
+  free(debugName);
   if (! symtab_found) {
     close(fd);
     return 0; // No symbol table found.
@@ -135,8 +135,7 @@ off_t get_symbol_offset(const char *pathname, const char *symbol) {
   }
 
   close(fd);
-  fprintf(stderr, "*** FAILED TO FIND symbol: %s\n", symbol);
-  exit(1);
+  return 0; // Allow the caller to try detached debug files.
 }
 
 
@@ -174,16 +173,19 @@ static int expandDebugFile(char *debugLibName,
       continue;
     } else if (entry->d_type == DT_DIR) {
       char dir2[PATH_MAX];
-      strncpy(dir2, dir, PATH_MAX);
-      strncat(dir2, "/", PATH_MAX - strlen(dir2) - 1);
-      strncat(dir2, entry->d_name, PATH_MAX - strlen(entry->d_name) - 1);
+      if (snprintf(dir2, sizeof(dir2), "%s/%s", dir, entry->d_name)
+          >= sizeof(dir2)) {
+        continue;
+      }
       if (expandDebugFile(debugLibName, dir2, debugName)) {
+        closedir(directory);
         return 1; // found a match
       }
       // list_files_recursively(entry->d_name);
     } else {
       if (strcmp(entry->d_name, debugName) == 0) {
         snprintf(debugLibName, PATH_MAX, "%s/%s", dir, entry->d_name);
+        closedir(directory);
         return 1; // found a match
       }
     }
