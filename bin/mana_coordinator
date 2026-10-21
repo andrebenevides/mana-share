@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # if [ -n "$1" ]; then
 #   echo "USAGE:  $0 [--verbose] [DMTCP_OPTIONS ...]"
@@ -8,25 +8,30 @@
 # fi
 
 mana_coord=$0
-dir=`dirname $0`
+dir=$(dirname "$0")
 
-options=""
+options=()
 verbose=0
 help=0
+persistent=0
 while [ -n "$1" ]; do
   if [ "$1" = --verbose ]; then
     verbose=1
   elif [ "$1" = --help ]; then
     help=1
+  elif [ "$1" = --persistent ]; then
+    persistent=1
   else
-    options="$options $1"
+    options+=("$1")
   fi
   shift
 done
 
 if [ "$help" -eq 1 ]; then
-  $dir/dmtcp_coordinator --help $options
-  exit 0
+  echo "Usage: $mana_coord [--verbose] [--persistent] [DMTCP_OPTIONS ...]"
+  echo "  --persistent  Keep the coordinator running until explicitly stopped."
+  "$dir/dmtcp_coordinator" --help "${options[@]}"
+  exit $?
 fi
 
 SITE=unknown
@@ -45,7 +50,7 @@ if [ "$SITE" = "nersc" ]; then
 fi
 
 if [ "$verbose" = 0 ]; then
-  options="$options -q -q"
+  options+=(-q -q)
 fi
 
 if [ "$verbose" = 1 ]; then
@@ -60,23 +65,42 @@ else
   MANA_RC=$HOME/.mana.rc
 fi
 
-$dir/dmtcp_coordinator $options --exit-on-last -q --daemon --status-file $MANA_RC && coordinator_found=1
+if [ "$persistent" -eq 0 ]; then
+  options+=(--exit-on-last)
+fi
+"$dir/dmtcp_coordinator" "${options[@]}" -q --daemon --status-file "$MANA_RC" && coordinator_found=1
 set +x
 if [ $coordinator_found -eq 0 ]; then
   exit 3
 fi
 
+# Daemon startup can return before the coordinator finishes its status file.
+# Wait for both fields before announcing readiness or appending comments.
+status_ready=0
+for ((attempt=0; attempt<100; ++attempt)); do
+  if awk '/^Host: [^ ]/ {host=1} /^Port: [0-9]/ {port=1}
+          END {exit !(host && port)}' "$MANA_RC" 2>/dev/null; then
+    status_ready=1
+    break
+  fi
+  sleep 0.1
+done
+if [ "$status_ready" -eq 0 ]; then
+  echo "Coordinator did not write a complete status file: $MANA_RC" >&2
+  exit 3
+fi
+
 if [ ! -z "$SLURM_JOB_ID" ]; then
   if [ -e "$MANA_RC" ]; then
-    echo "SLURM_JOB_ID: $SLURM_JOB_ID" >> $MANA_RC
+    echo "SLURM_JOB_ID: $SLURM_JOB_ID" >> "$MANA_RC"
   else
     echo '*** MANA problem: Running in Slurm job ' \
          "$SLURM_JOB_ID; $MANA_RC not found"
   fi
 fi
-echo '' >> $MANA_RC
-echo '# This is a temporary file for communication between' >> $MANA_RC
-echo '#   mana_coordinator and mana_launch/mana_restart.' >> $MANA_RC
+echo '' >> "$MANA_RC"
+echo '# This is a temporary file for communication between' >> "$MANA_RC"
+echo '#   mana_coordinator and mana_launch/mana_restart.' >> "$MANA_RC"
 echo '*** '"Coordinator/job information written to $MANA_RC"
 
 # srun -n1 -c1 --cpu-bind=cores bin/dmtcp_launch  -i10 -h `hostname` --no-gzip --join --disable-dl-plugin --with-plugin $PWD/lib/dmtcp/libmana.so contrib/mpi-proxy-split/test/mpi_hello_world.mana.exe

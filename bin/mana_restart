@@ -2,6 +2,8 @@
 import sys
 import os
 import shutil
+import shlex
+import subprocess
 
 help_msg = '''
   USAGE: [srun/mpirun] mana_restart [--verbose] [--timing] [DMTCP_OPTIONS ...]
@@ -30,22 +32,49 @@ if "--timing" in dmtcp_flags:
   os.environ["MANA_TIMING"] = "1"
   dmtcp_flags.remove("--timing")
 if "--restartdir" not in dmtcp_flags:
-  dmtcp_flags.append("--restartdir ./")
-if "--restartdir" in dmtcp_flags:
-  ckptdir_path = dmtcp_flags[dmtcp_flags.index("--restartdir") + 1]
-  if not os.path.exists(ckptdir_path):
-    print("mana_restart: --restartdir " + ckptdir_path + 
-          ": Restart directory doesn't exist")
+    dmtcp_flags.extend(["--restartdir", "./"])
+
+restartdir_index = dmtcp_flags.index("--restartdir")
+
+if (restartdir_index + 1 >= len(dmtcp_flags) or
+        dmtcp_flags[restartdir_index + 1].startswith("-")):
+    print("mana_restart: --restartdir requires a directory")
     sys.exit(1)
-  for rank_dir in os.listdir(ckptdir_path):
-    if (os.path.isfile(rank_dir)):
-      continue
-    for fname in os.listdir(rank_dir):
-      if fname.endswith('.tmp'):
-        print("mana_restart: --restartdir " + ckptdir_path + 
-              ": Restart directory has .tmp files. ")
-        print("Previous checkpoint may be incomplete.")
-        sys.exit(1)
+
+restartdir_path = os.path.abspath(
+    os.path.expanduser(dmtcp_flags[restartdir_index + 1])
+)
+
+if not os.path.isdir(restartdir_path):
+    print(
+        "mana_restart: --restartdir "
+        + restartdir_path
+        + ": Restart directory doesn't exist"
+    )
+    sys.exit(1)
+
+for rank_entry in os.scandir(restartdir_path):
+    if not rank_entry.is_dir():
+        continue
+    for checkpoint_entry in os.scandir(rank_entry.path):
+        if checkpoint_entry.name.endswith(".tmp"):
+            print(
+                "mana_restart: --restartdir "
+                + restartdir_path
+                + ": Restart directory has .tmp files."
+            )
+            print("Previous checkpoint may be incomplete.")
+            sys.exit(1)
+
+dmtcp_flags[restartdir_index + 1] = restartdir_path
+
+# lower-half replaces this pair with a rank-specific checkpoint image.
+# Keep it after all other DMTCP options so the image is the final
+# positional argument.
+restartdir_pair = dmtcp_flags[restartdir_index:restartdir_index + 2]
+del dmtcp_flags[restartdir_index:restartdir_index + 2]
+dmtcp_flags.extend(restartdir_pair)
+
 if "--ckptdir" in dmtcp_flags:
   ckptdir_path = dmtcp_flags[dmtcp_flags.index("--ckptdir") + 1]
   if not os.path.exists(ckptdir_path):
@@ -68,8 +97,7 @@ if "--quiet" in dmtcp_flags or "-q" in dmtcp_flags:
 
 # Find the .mana.rc file to get the hostname and port of the coordinator
 rc_filename = ""
-host_flag = ""
-port_flag = ""
+coordinator_flags = []
 if "SLURM_JOB_ID" in os.environ:
   rc_filename = os.path.expanduser("~/.mana-slurm-" + os.environ["SLURM_JOB_ID"] + ".rc")
 else:
@@ -78,18 +106,21 @@ rc_file = open(rc_filename)
 for line in rc_file:
   line = line.split()
   if not line:
-    break
+    continue
   if line[0] == "Host:":
-    host_flag = " -h " + line[1] + " "
+    coordinator_flags.extend(["-h", line[1]])
   elif line[0] == "Port:":
-    port_flag = " -p " + line[1] + " "
+    coordinator_flags.extend(["-p", line[1]])
 rc_file.close()
 
 # Remove old ~/.mana_*.rc files from a week ago or more.
 os.system("find $HOME/.mana*.rc -ignore_readdir_race -maxdepth 0 -mtime +7 -type f -delete")
 
 # Check dmtcp coordinator
-coordinator_found = os.system(mana_root_path + "bin/dmtcp_command -s " + host_flag + port_flag + " &>/dev/null")
+coordinator_found = subprocess.run(
+  [mana_root_path + "bin/dmtcp_command", "-s"] + coordinator_flags,
+  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+).returncode
 if coordinator_found != 0:
   print("No MANA coordinator detected. Try:")
   print("  " + mana_root_path + "bin/dmtcp_coordinator")
@@ -99,15 +130,16 @@ if coordinator_found != 0:
 
 # Build the command line to be executed
 if not verbose:
-  dmtcp_flags.insert(0, "-q -q")
+  dmtcp_flags[0:0] = ["-q", "-q"]
 if gdb:
-  cmd_line = shutil.which("gdb") + " --args "
+  cmd_line = [shutil.which("gdb"), "--args"]
 else:
-  cmd_line = ""
-cmd_line += mana_root_path + "bin/lower-half -j --restore " + host_flag + port_flag + " ".join(dmtcp_flags)
+  cmd_line = []
+cmd_line += [mana_root_path + "bin/lower-half", "-j", "--restore"]
+cmd_line += coordinator_flags + dmtcp_flags
 if verbose:
-  print(cmd_line)
+  print(" ".join(shlex.quote(arg) for arg in cmd_line))
 
 # This is for debug only
 # cmd_line = "/usr/bin/echo " + cmd_line
-os.execv(cmd_line.split()[0], cmd_line.split())
+os.execv(cmd_line[0], cmd_line)
